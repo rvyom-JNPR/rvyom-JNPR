@@ -1,7 +1,7 @@
 - 👋 Hi, I’m @rvyom-JNPR
 - 👀 I’m interested in Software Development
 - 🌱 I’m currently learning Golang, Rust
-- 📫 How to reach me. You can reach me at vyomraj13@gmail.com
+- 📫 How to reach me.
 - 😄 Pronouns: ...
 - ⚡ Fun fact: ...
 
