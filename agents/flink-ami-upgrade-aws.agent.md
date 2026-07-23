@@ -28,19 +28,31 @@ Handles zero-downtime Flink AMI upgrades on AWS EKS using Karpenter red-black no
 
 ## AWS Profile Convention
 
-Profile names are environment-scoped: `<env>-admin`, `<env>-viewer`, `<env>-oncall`.
+**Always use the `-admin` profile for the target environment.** Resolve it automatically from `~/.aws/config`:
 
 ```bash
-# Always use the env-specific admin profile
-aws-okta exec <env>-admin -- <command>
+# Automatically find the admin profile for an environment
+ENV=eu
+PROFILE=$(grep -o "profile ${ENV}-[a-z]*" ~/.aws/config | grep "\-admin$" | head -1 | awk '{print $2}')
+echo "Using profile: $PROFILE"
+# → eu-admin
 
-# Example for EU:
-aws-okta exec eu-admin -- kubectl --context=eu-2-green get nodes
+# Then use it for all commands:
+aws-okta exec $PROFILE -- <command>
 ```
 
-Check available profiles:
+If no `-admin` profile exists, fall back to `-oncall`:
 ```bash
-grep -A1 "^\[profile" ~/.aws/config | grep -i "<env>"
+PROFILE=$(grep -o "profile ${ENV}-[a-z]*" ~/.aws/config \
+  | grep -E "\-(admin|oncall)$" | grep admin | head -1 | awk '{print $2}')
+PROFILE=${PROFILE:-$(grep -o "profile ${ENV}-[a-z]*" ~/.aws/config \
+  | grep "\-oncall$" | head -1 | awk '{print $2}')}
+echo "Using profile: $PROFILE"
+```
+
+List all profiles for an environment:
+```bash
+grep -o "profile ${ENV}-[a-z-]*" ~/.aws/config | awk '{print $2}'
 ```
 
 ## Cluster Context Setup
@@ -354,20 +366,33 @@ aws-okta exec <env>-admin -- kubectl --context=<env>-2-green get nodepools 2>&1 
 | Jobmanagers land on new red nodes after restart | Karpenter provisions new red nodes before pods schedule to black — cordon and drain those new red nodes |
 | flink-app clusters also present | Check `kubectl get ns \| grep flink-app`; run `move-all-jobs` for `app` type too and drain app nodes separately |
 
-## Quick Reference — EU Environment
+## Quick Reference — Session Setup
+
+Run this block at the start of any session to set all variables:
 
 ```bash
-ENV=eu
-CONTEXT=eu-2-green
-PROFILE=eu-admin
-MIST_SK8R=~/workspace/mist-sk8r/eu-2-green.eks
+# Set your environment name
+ENV=eu   # change this per environment
+
+# Auto-resolve admin profile from ~/.aws/config
+PROFILE=$(grep -o "profile ${ENV}-[a-z]*" ~/.aws/config \
+  | grep "\-admin$" | head -1 | awk '{print $2}')
+echo "Profile: $PROFILE"
+
+# Derive other vars
+CONTEXT="${ENV}-2-green"
+MIST_SK8R=~/workspace/mist-sk8r/${CONTEXT}.eks
 KARPENTER_NP_PATH=$MIST_SK8R/config/flux-monitored/karpenter-nodepools
-INFLATE_PATH=~/workspace/devops/adhoc/k8s/inflate-karpenter-nodepools/eks-2-black
 
-# All kubectl commands:
-aws-okta exec eu-admin -- kubectl --context=eu-2-green <cmd>
+# Init kubectl context (run once)
+cd $MIST_SK8R && PROFILE_NAME=$(echo $PROFILE | sed "s/${ENV}-//") \
+  PROFILE=$PROFILE_NAME bash init-kube-config
 
-# All mistcli commands:
-aws-okta exec eu-admin -- mistcli flink eu <cmd>
-aws-okta exec eu-admin -- mistcli flink operator la eu green <cmd>
+# Verify access
+aws-okta exec $PROFILE -- kubectl --context=$CONTEXT get nodepools | grep flink
+
+# Template for all commands:
+# aws-okta exec $PROFILE -- kubectl --context=$CONTEXT <cmd>
+# aws-okta exec $PROFILE -- mistcli flink $ENV <cmd>
+# aws-okta exec $PROFILE -- mistcli flink operator la $ENV green <cmd>
 ```
