@@ -518,6 +518,7 @@ gh pr merge <PR_NUMBER> --squash --delete-branch
 | Branch carries unrelated commits | Branch created from a feature branch instead of main | Always: `git checkout -b <branch> origin/main` |
 | Red nodes still showing in GCP console | Drain evicts pods but GKE CA takes time to terminate nodes | Wait a few minutes; verify with `kubectl get nodes` |
 | GKE auto-upgrades new node pools to master version | GKE cluster master was already at a newer version than specified | Expected behavior — after apply, check actual node version and sync `gke_config.hcl` if different |
+| Terragrunt apply interrupted (Ctrl+C), state lock not released | Ctrl+C during interactive `yes` prompt leaves a stale GCS lock | Run `terragrunt force-unlock <LOCK_ID>` (ID shown in the error), then re-apply |
 | `terragrunt plan` opens a pager | terragrunt uses `less`/`more` by default in some versions | Provide the command to the user to run in their own terminal; do not pipe through grep |
 | Red TM nodes auto-deleted before explicit drain | GKE CA automatically removes cordoned+empty nodes | Verify with `kubectl get nodes` first — if already gone, skip TM drain. JM nodes typically need explicit drain. |
 
