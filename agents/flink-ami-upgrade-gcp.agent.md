@@ -158,20 +158,41 @@ https://mistsys.atlassian.net/browse/MIST-XXXXXX"
 
 ### Phase 2b: Terragrunt Plan & Apply
 
-```bash
-cd ~/workspace/iac/${ENV}-gcp/auto/gke-2-green
+> ⚠️ **Pager issue**: `terragrunt plan` may open an interactive pager (less/more). Provide the plan command to the user to run in their own terminal rather than piping through grep. Ask for confirmation on the plan output before applying.
 
+Provide user with this command block to run themselves:
+```bash
 export GOOGLE_OAUTH_ACCESS_TOKEN=$(gcloud auth print-access-token \
   --impersonate-service-account terraform-create-${ENV}@mist-infrastructure-iam.iam.gserviceaccount.com)
 
-terragrunt plan 2>&1 | tail -60
-# Verify: "Plan: 4 to add, 0 to change, 0 to destroy" (2 node pools + 2 random_id resources)
+cd ~/workspace/iac/${ENV}-gcp/auto/gke-2-green
+terragrunt plan
+```
+Expected plan: `Plan: 4 to add, 0 to change, 0 to destroy` (2 node pools + 2 random_id resources).
 
-# After confirmation:
-terragrunt apply -auto-approve 2>&1 | tail -20
+After user confirms plan is correct, ask them to apply:
+```bash
+terragrunt apply
 ```
 
 > ⚠️ **Auth note**: Export `GOOGLE_OAUTH_ACCESS_TOKEN` in the **same shell** as `terragrunt`. It does not persist across subshells.
+
+**After apply — check for GKE auto-upgrade:**
+
+GKE may auto-upgrade newly created node pools to the current cluster master version, even if a different version was specified in config. After apply, always check the actual version:
+
+```bash
+kubectl --context $CONTEXT get nodes -l role=flink-taskmanager --no-headers | awk '{print $5}' | sort | uniq -c
+```
+
+If the actual version differs from what was specified (e.g., GKE upgraded `1.33.12-gke.1270000` → `1.33.13-gke.1011000`), sync the config:
+```bash
+# Update gke_config.hcl to reflect actual version
+# Then commit:
+git add ${ENV}-gcp/auto/gke-2-green/gke_config.hcl
+git commit -m "fix(${ENV}): Sync black node pool version to actual GKE auto-upgraded version <actual-version>"
+git push
+```
 
 ---
 
@@ -186,6 +207,8 @@ kubectl --context $CONTEXT get nodes -l role=flink-jobmanager --no-headers
 ```
 
 Zero nodes is expected since both pools start with `min_count=0`. They scale up after inflate pods.
+
+> ⚠️ **GKE auto-upgrade**: GKE may create the new pools at a higher version than specified if the cluster master is already at that version. This is normal — check with the node pool version output from `terragrunt apply` and sync `gke_config.hcl` if needed (see Phase 2b).
 
 ---
 
@@ -362,6 +385,16 @@ mistcli flink operator app ${ENV} green migration-status
 
 ### Phase 11: Drain Old Nodes
 
+> ✅ **Check first**: GKE CA often automatically deletes cordoned+empty taskmanager nodes once there are no pods on them. Before draining, check how many old-version nodes are still present:
+
+```bash
+# Check which old nodes remain
+kubectl --context $CONTEXT get nodes -l role=flink-taskmanager --no-headers | awk '{print $2, $5}' | sort | uniq -c
+kubectl --context $CONTEXT get nodes -l role=flink-jobmanager --no-headers | awk '{print $2, $5}' | sort | uniq -c
+```
+
+If old-version (e.g., `1.33.11`) nodes are still present, drain them:
+
 ```bash
 # Check what's still on old-version nodes
 kubectl --context $CONTEXT get nodes -l role=flink-taskmanager --no-headers | grep "<old-version>"
@@ -431,39 +464,42 @@ flink-taskmanager-<old-color> = [
 ]
 ```
 
-**Step 3 — Commit, plan, apply:**
+**Step 3 — Verify 0 red nodes before cleanup:**
+
+Before removing old pools from config, confirm they are at 0 nodes:
 ```bash
-cd ~/workspace/iac
-git add ${ENV}-gcp/auto/gke-2-green/gke_config.hcl
-git commit -m "chore(${ENV}): Remove flink-{jobmanager,taskmanager}-<old-color> node pools
-
-Migration to <new-color> complete.
-
-MIST-XXXXXX"
-git push
-
-# Plan first — show the user before applying
-cd ${ENV}-gcp/auto/gke-2-green
-export GOOGLE_OAUTH_ACCESS_TOKEN=$(gcloud auth print-access-token \
-  --impersonate-service-account terraform-create-${ENV}@mist-infrastructure-iam.iam.gserviceaccount.com)
-terragrunt plan 2>&1 | grep -E "Plan:|will be destroyed|# google_container_node_pool"
-# Expected: "Plan: 0 to add, 0 to change, 4 to destroy"
-
-# After user confirmation:
-terragrunt apply -auto-approve
+kubectl --context $CONTEXT get nodes -l role=flink-taskmanager --no-headers | awk '{print $2, $5}' | sort | uniq -c
+kubectl --context $CONTEXT get nodes -l role=flink-jobmanager --no-headers | awk '{print $2, $5}' | sort | uniq -c
+# All remaining nodes should be <new-version> / Ready
 ```
 
-**Step 4 — Add completion comment to PR:**
+Also verify in the GCP console: `Kubernetes Engine → Clusters → <cluster> → Nodes`  
+Confirm `flink-jobmanager-<old-color>` and `flink-taskmanager-<old-color>` show **0 nodes**.
+
+**Step 4 — Commit, plan, apply:**
+
+Provide user with commands to run in their own terminal (avoids pager issue):
+```bash
+export GOOGLE_OAUTH_ACCESS_TOKEN=$(gcloud auth print-access-token \
+  --impersonate-service-account terraform-create-${ENV}@mist-infrastructure-iam.iam.gserviceaccount.com)
+cd ~/workspace/iac/${ENV}-gcp/auto/gke-2-green
+terragrunt plan
+# Expected: "Plan: 0 to add, 0 to change, 4 to destroy"
+terragrunt apply
+```
+
+**Step 5 — Add completion comment to PR:**
 ```bash
 gh pr comment <PR_NUMBER> --body "## Upgrade Complete ✅
 - Old version: \`<old-version>\` (<old-color>)
 - New version: \`<new-version>\` (<new-color>)
 - LA jobs on primary: X/X (100%)
 - App jobs on primary: X/X (100%)
-- Red node pools: Deleted"
+- Red node pools: Deleted
+- Jira: https://mistsys.atlassian.net/browse/MIST-XXXXXX"
 ```
 
-**Step 5 — Merge PR when approved:**
+**Step 6 — Merge PR when approved:**
 ```bash
 gh pr merge <PR_NUMBER> --squash --delete-branch
 ```
@@ -481,6 +517,9 @@ gh pr merge <PR_NUMBER> --squash --delete-branch
 | Terragrunt auth fails with personal identity (403 on state bucket) | `GOOGLE_OAUTH_ACCESS_TOKEN` not exported in the same shell | Run `export GOOGLE_OAUTH_ACCESS_TOKEN=...` and `terragrunt plan/apply` in the same shell/command |
 | Branch carries unrelated commits | Branch created from a feature branch instead of main | Always: `git checkout -b <branch> origin/main` |
 | Red nodes still showing in GCP console | Drain evicts pods but GKE CA takes time to terminate nodes | Wait a few minutes; verify with `kubectl get nodes` |
+| GKE auto-upgrades new node pools to master version | GKE cluster master was already at a newer version than specified | Expected behavior — after apply, check actual node version and sync `gke_config.hcl` if different |
+| `terragrunt plan` opens a pager | terragrunt uses `less`/`more` by default in some versions | Provide the command to the user to run in their own terminal; do not pipe through grep |
+| Red TM nodes auto-deleted before explicit drain | GKE CA automatically removes cordoned+empty nodes | Verify with `kubectl get nodes` first — if already gone, skip TM drain. JM nodes typically need explicit drain. |
 
 ## Inflate Pod Manifest Locations
 
@@ -502,8 +541,10 @@ The `replicas` field in each file reflects the **last applied count**. Always ve
 - [ ] Add new color node pool blocks to `gke_config.hcl`
 - [ ] Stage only `gke_config.hcl` and commit
 - [ ] Push and create PR with Jira link
-- [ ] Run terragrunt plan — verify 4 to add
-- [ ] Run terragrunt apply
+- [ ] Run terragrunt plan (provide command to user — avoid pager issue)
+- [ ] Confirm plan shows 4 to add — ask user to apply
+- [ ] After apply: check actual node version vs requested (GKE may auto-upgrade)
+- [ ] If version differs from config, sync `gke_config.hcl` and commit
 - [ ] Verify new node pools exist (0 nodes expected at this stage)
 - [ ] Cordon all old-color flink nodes
 - [ ] Apply inflate pods for new color
@@ -516,11 +557,13 @@ The `replicas` field in each file reflects the **last applied count**. Always ve
 - [ ] Run `mistcli flink operator la <env> green move-all-jobs-back` (confirm yes)
 - [ ] Run `mistcli flink operator app <env> green move-all-jobs-back` (confirm yes)
 - [ ] Monitor until 100% on primary
-- [ ] Drain old-color nodes (`--ignore-daemonsets --delete-emptydir-data --force`)
-- [ ] Verify no flink workloads on old nodes
+- [ ] Check if old-color nodes still exist (`kubectl get nodes` by version) — GKE CA may have auto-deleted TM nodes
+- [ ] Drain remaining old-version nodes (typically JM nodes need explicit drain; TM often auto-removed)
+- [ ] Verify in GCP console that old pool shows 0 nodes before cleanup
 - [ ] Scale down / delete inflate pods
-- [ ] Remove old color blocks from `gke_config.hcl` (node_pools, labels, taints, oauth_scopes)
-- [ ] Commit cleanup, push, terragrunt plan (show user first)
-- [ ] Terragrunt apply to delete old node pools
-- [ ] Add completion comment to PR
+- [ ] Remove old color blocks from `gke_config.hcl` (node_pools only — labels/taints/oauth_scopes for both colors are pre-defined)
+- [ ] Commit cleanup, push
+- [ ] Provide terragrunt plan command to user (avoid pager issue)
+- [ ] Ask user to confirm plan shows 4 to destroy, then apply
+- [ ] Add completion comment to PR (include Jira link)
 - [ ] Merge PR when approved
