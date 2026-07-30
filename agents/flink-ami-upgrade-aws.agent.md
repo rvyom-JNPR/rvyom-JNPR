@@ -128,6 +128,12 @@ aws-okta exec <env>-admin -- kubectl --context=<env>-2-green \
 
 ### Phase 5: Deploy Inflate Pods
 
+> ✅ **Check first**: If Karpenter has already provisioned new-color TM nodes (e.g., after a PR was merged but migration never started), the inflate step for TM may not be needed. Check counts first:
+> ```bash
+> aws-okta exec <env>-admin -- kubectl --context=<env>-2-green get nodepools | grep flink
+> ```
+> If `flink-taskmanager-<new-color>` already has nodes ≥ old-color count, **skip TM inflate** and only inflate JM.
+
 Calculate target: `current_node_count + 5` for each pool.
 
 ```bash
