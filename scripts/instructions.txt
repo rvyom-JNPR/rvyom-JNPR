@@ -1,0 +1,2 @@
+run this as:
+python3 verify_flink_push.py mistsys/versions 10914 --env gcp.asne1prod7 --verify

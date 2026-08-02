@@ -1,0 +1,36 @@
+1) checked policy does not exist on the bucket
+
+aws-okta exec dev-admin -- aws s3api get-bucket-policy \                                    ✔  3m 1s
+  --bucket vyom-test-cross-provider 2>&1
+
+aws: [ERROR]: An error occurred (NoSuchBucketPolicy) when calling the GetBucketPolicy operation: The bucket policy does not exist
+
+Additional error details:
+BucketName: vyom-test-cross-provider
+exit status 254
+ ~/w/iac/usw/a/i/dataproc-mec2prod6-gcp-trust-policy  rvyom/sre-209042-ctkb-access !3  aws-okta exec mist-admin -- aws iam list-attached-role-policies \                            1 ✘  3s
+  --role-name mistsys-staging-emr-ec2 \
+  --query "AttachedPolicies[?contains(PolicyName,'ctkb')]"
+ ~/w/iac/usw/a/i/dataproc-mec2prod6-gcp-trust-policy  rvyom/sre-209042-ctkb-access !3
+
+
+2) login to emr
+ aws-okta exec mist-admin -- aws ssm start-session \                                              ✔
+  --target i-0411e8a19cfca2965 \
+  --region us-east-1
+
+
+Starting session with SessionId: rvyom@juniper.net-g2bnye9g8vrq38eiscrti44vfi
+sh-5.2$
+
+3) sh-5.2$ aws s3 ls s3://vyom-test-cross-provider/ 2>&1
+
+An error occurred (AccessDenied) when calling the ListObjectsV2 operation: User: arn:aws:sts::660610034966:assumed-role/mistsys-staging-emr-ec2/i-0411e8a19cfca2965 is not authorized to perform: s3:ListBucket on resource: "arn:aws:s3:::vyom-test-cross-provider" because no resource-based policy allows the s3:ListBucket action
+sh-5.2$
+
+
+4)  aws s3 cp s3://vyom-test-cross-provider/test.txt /tmp/test_negative.txt 2>&1
+fatal error: An error occurred (403) when calling the HeadObject operation: Forbidden
+sh-5.2$
+
+5) 

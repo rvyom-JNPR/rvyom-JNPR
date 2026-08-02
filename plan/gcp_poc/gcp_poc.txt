@@ -1,0 +1,316 @@
+PHASE 0 — Prep: Create S3 Bucket
+
+Run from your laptop.
+
+0a. Create the bucket
+
+aws-okta exec dev-admin -- aws s3api create-bucket \
+  --bucket vyom-test-cross-provider \
+  --region us-west-2 \
+  --create-bucket-configuration LocationConstraint=us-west-2
+
+0b. Block public access
+
+aws-okta exec dev-admin -- aws s3api put-public-access-block \
+  --bucket vyom-test-cross-provider \
+  --public-access-block-configuration \
+    BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
+
+0c. Seed a test file
+
+echo 'hello cross-provider' | aws-okta exec dev-admin -- aws s3 cp - s3://vyom-test-cross-provider/test.txt
+
+0d. Verify the file is there
+
+aws-okta exec dev-admin -- aws s3 ls s3://vyom-test-cross-provider/
+# Expected: test.txt listed
+
+────────────────────
+
+PHASE 1 — Pre-checks: Confirm Nothing Is Set Up Yet
+
+Run from your laptop. Screenshot all outputs.
+
+1a. Confirm SA ID is NOT in OIDC provider audience list
+
+aws-okta exec dev-admin -- aws iam get-open-id-connect-provider \
+  --open-id-connect-provider-arn arn:aws:iam::125952381355:oidc-provider/accounts.google.com
+
+✅ Expected:  111695966871158907715  is absent from  ClientIDList 
+
+1b. Confirm IAM role does NOT exist yet
+
+aws-okta exec dev-admin -- aws iam get-role \
+  --role-name dataproc_mec2prod6_gcp_trust_role
+
+✅ Expected:  NoSuchEntity  error
+
+1c. Confirm IAM policy does NOT exist yet
+
+aws-okta exec dev-admin -- aws iam list-policies --scope Local \
+  --query "Policies[?PolicyName=='dataproc-mec2prod6-gcp-ctkb-test']"
+
+✅ Expected: empty list  [] 
+
+────────────────────
+
+PHASE 2 — Negative Test: SSH to Dataproc, Confirm No Access
+
+SSH from your laptop, run script on the Dataproc node.
+
+2a. SSH into the Dataproc node
+
+gcloud compute ssh --zone "me-central2-a" "af2-action-and-suggestion-w-0" \
+  --tunnel-through-iap --project "mist-dataproc-mec2prod6"
+
+2b. Confirm you are running as the correct SA
+
+curl -s -H "Metadata-Flavor: Google" \
+  "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/email"
+# Expected: mist-dataproc@mist-dataproc-mec2prod6.iam.gserviceaccount.com
+
+2c. Create the negative test script
+
+cat > /tmp/ctkb_negative_test.py << 'EOF'
+import boto3
+import google.auth.transport.requests
+from google.oauth2 import id_token
+
+AUDIENCE = "111695966871158907715"
+ROLE_ARN = "arn:aws:iam::125952381355:role/dataproc_mec2prod6_gcp_trust_role"
+BUCKET   = "vyom-test-cross-provider"
+
+print("=" * 50)
+print("NEGATIVE TEST — expect all steps to FAIL")
+print("=" * 50)
+
+# Step 1: Get OIDC token — this WILL succeed (SA can always get tokens)
+try:
+    auth_request = google.auth.transport.requests.Request()
+    token = id_token.fetch_id_token(auth_request, AUDIENCE)
+    print("\n[STEP 1] OIDC token fetch: SUCCESS (expected - SA can always get tokens)")
+    print("         Token preview:", token[:40], "...")
+except Exception as e:
+    print("\n[STEP 1] OIDC token fetch: FAILED (unexpected):", e)
+    exit(1)
+
+# Step 2: Try to assume role — should FAIL (role doesn't exist, SA ID not in audience)
+print("\n[STEP 2] Attempting sts:AssumeRoleWithWebIdentity ...")
+try:
+    sts = boto3.client("sts", region_name="us-west-2")
+    creds = sts.assume_role_with_web_identity(
+        RoleArn=ROLE_ARN,
+        RoleSessionName="ctkb-negative-test",
+        WebIdentityToken=token,
+    )["Credentials"]
+    print("         ERROR: Role assumed successfully — this should NOT have worked!")
+except Exception as e:
+    print("         EXPECTED FAILURE:", type(e).__name__, "-", str(e)[:100])
+
+# Step 3: Try direct S3 access (no creds) — should FAIL
+print("\n[STEP 3] Attempting S3 access without valid credentials ...")
+try:
+    s3 = boto3.client("s3", region_name="us-west-2")
+    s3.download_file(BUCKET, "test.txt", "/tmp/test_negative.txt")
+    print("         ERROR: S3 download succeeded — this should NOT have worked!")
+except Exception as e:
+    print("         EXPECTED FAILURE:", type(e).__name__, "-", str(e)[:100])
+
+print("\n" + "=" * 50)
+print("NEGATIVE TEST COMPLETE — all failures above are expected ✓")
+print("=" * 50)
+EOF
+
+2d. Run the negative test
+
+python3 /tmp/ctkb_negative_test.py
+
+✅ Expected output:
+
+==================================================
+NEGATIVE TEST — expect all steps to FAIL
+==================================================
+
+[STEP 1] OIDC token fetch: SUCCESS (expected - SA can always get tokens)
+         Token preview: eyJhbGciOiJSUzI1NiIsImtpZCI6...
+
+[STEP 2] Attempting sts:AssumeRoleWithWebIdentity ...
+         EXPECTED FAILURE: ClientError - An error occurred (NoSuchEntity)...
+
+[STEP 3] Attempting S3 access without valid credentials ...
+         EXPECTED FAILURE: ClientError - An error occurred (403)...
+
+==================================================
+NEGATIVE TEST COMPLETE — all failures above are expected ✓
+==================================================
+
+📸 Screenshot this — proof of no access before setup.
+
+────────────────────
+
+PHASE 3 — Enable Access: Manual AWS Setup + IaC Apply
+
+Back on your laptop.
+
+3a. Add SA unique ID to OIDC provider audience
+
+aws-okta exec dev-admin -- aws iam add-client-id-to-open-id-connect-provider \
+  --open-id-connect-provider-arn arn:aws:iam::125952381355:oidc-provider/accounts.google.com \
+  --client-id 111695966871158907715
+
+3b. Verify SA ID is now listed
+
+aws-okta exec dev-admin -- aws iam get-open-id-connect-provider \
+  --open-id-connect-provider-arn arn:aws:iam::125952381355:oidc-provider/accounts.google.com \
+  | grep 111695966871158907715
+# Expected: "111695966871158907715" present
+
+3c. Apply IaC — create IAM policy
+
+cd usw2dev2-aws/auto/iam/dataproc-mec2prod6-gcp-trust-policy
+terragrunt apply
+
+✅ Creates:  dataproc-mec2prod6-gcp-ctkb-test  policy (S3  ListBucket  +  GetObject  on  vyom-test-cross-provider )
+
+3d. Apply IaC — create IAM role
+
+cd ../dataproc-mec2prod6-gcp-trust-role
+terragrunt apply
+
+✅ Creates:  dataproc_mec2prod6_gcp_trust_role  with OIDC trust for SA  111695966871158907715 
+
+3e. Verify role and trust policy
+
+aws-okta exec dev-admin -- aws iam get-role \
+  --role-name dataproc_mec2prod6_gcp_trust_role \
+  --query 'Role.AssumeRolePolicyDocument'
+
+aws-okta exec dev-admin -- aws iam list-attached-role-policies \
+  --role-name dataproc_mec2prod6_gcp_trust_role
+
+✅ Expected: trust condition  accounts.google.com:aud = 111695966871158907715 , policy attached
+
+────────────────────
+
+PHASE 4 — Positive Test: SSH Back to Dataproc, Confirm Access Works
+
+SSH back to Dataproc node.
+
+4a. SSH back in
+
+gcloud compute ssh --zone "me-central2-a" "af2-action-and-suggestion-w-0" \
+  --tunnel-through-iap --project "mist-dataproc-mec2prod6"
+
+4b. Create the positive test script
+
+cat > /tmp/ctkb_positive_test.py << 'EOF'
+import boto3
+import google.auth.transport.requests
+from google.oauth2 import id_token
+
+AUDIENCE = "111695966871158907715"
+ROLE_ARN = "arn:aws:iam::125952381355:role/dataproc_mec2prod6_gcp_trust_role"
+BUCKET   = "vyom-test-cross-provider"
+
+print("=" * 50)
+print("POSITIVE TEST — expect all steps to SUCCEED")
+print("=" * 50)
+
+# Step 1: Get OIDC token
+auth_request = google.auth.transport.requests.Request()
+token = id_token.fetch_id_token(auth_request, AUDIENCE)
+print("\n[STEP 1] OIDC token fetch: SUCCESS ✓")
+print("         Token preview:", token[:40], "...")
+
+# Step 2: Assume AWS role via OIDC
+sts = boto3.client("sts", region_name="us-west-2")
+response = sts.assume_role_with_web_identity(
+    RoleArn=ROLE_ARN,
+    RoleSessionName="ctkb-positive-test",
+    WebIdentityToken=token,
+)
+creds = response["Credentials"]
+print("\n[STEP 2] sts:AssumeRoleWithWebIdentity: SUCCESS ✓")
+print("         Role ARN  :", response["AssumedRoleUser"]["Arn"])
+print("         Expires at:", creds["Expiration"])
+
+# Step 3: List S3 bucket
+s3 = boto3.client(
+    "s3",
+    aws_access_key_id=creds["AccessKeyId"],
+    aws_secret_access_key=creds["SecretAccessKey"],
+    aws_session_token=creds["SessionToken"],
+    region_name="us-west-2",
+)
+objects = s3.list_objects_v2(Bucket=BUCKET)
+print("\n[STEP 3] s3:ListBucket: SUCCESS ✓")
+for obj in objects.get("Contents", []):
+    print("         -", obj["Key"], "(", obj["Size"], "bytes )")
+
+# Step 4: Download file
+s3.download_file(BUCKET, "test.txt", "/tmp/ctkb_result.txt")
+content = open("/tmp/ctkb_result.txt").read().strip()
+print("\n[STEP 4] s3:GetObject: SUCCESS ✓")
+print("         File content:", content)
+
+print("\n" + "=" * 50)
+print("POSITIVE TEST COMPLETE — all steps succeeded ✓")
+print("=" * 50)
+EOF
+
+4c. Run the positive test
+
+python3 /tmp/ctkb_positive_test.py
+
+✅ Expected output:
+
+==================================================
+POSITIVE TEST — expect all steps to SUCCEED
+==================================================
+
+[STEP 1] OIDC token fetch: SUCCESS ✓
+         Token preview: eyJhbGciOiJSUzI1NiIsImtpZCI6...
+
+[STEP 2] sts:AssumeRoleWithWebIdentity: SUCCESS ✓
+         Role ARN  : arn:aws:iam::125952381355:assumed-role/dataproc_mec2prod6_gcp_trust_role/ctkb-positive-test
+         Expires at: 2026-08-02 14:xx:xx+00:00
+
+[STEP 3] s3:ListBucket: SUCCESS ✓
+         - test.txt ( 21 bytes )
+
+[STEP 4] s3:GetObject: SUCCESS ✓
+         File content: hello cross-provider
+
+==================================================
+POSITIVE TEST COMPLETE — all steps succeeded ✓
+==================================================
+
+📸 Screenshot this — proof of access working after setup.
+
+────────────────────
+
+Summary Checklist
+
+┌───────┬───────┬──────────────────────────────────────────────────┬───────────────┐
+│ Phase │ Step  │ Action                                           │ Where         │
+├───────┼───────┼──────────────────────────────────────────────────┼───────────────┤
+│ 0     │ 0a–0d │ Create + seed vyom-test-cross-provider bucket    │ Laptop        │
+├───────┼───────┼──────────────────────────────────────────────────┼───────────────┤
+│ 1     │ 1a–1c │ Verify role, policy, OIDC audience all absent    │ Laptop        │
+├───────┼───────┼──────────────────────────────────────────────────┼───────────────┤
+│ 2     │ 2a    │ SSH to af2-action-and-suggestion-w-0             │ Laptop→GCP    │
+├───────┼───────┼──────────────────────────────────────────────────┼───────────────┤
+│ 2     │ 2b    │ Verify SA identity on node                       │ Dataproc node │
+├───────┼───────┼──────────────────────────────────────────────────┼───────────────┤
+│ 2     │ 2c–2d │ Run negative test, screenshot failures           │ Dataproc node │
+├───────┼───────┼──────────────────────────────────────────────────┼───────────────┤
+│ 3     │ 3a–3b │ Add SA ID 111695966871158907715 to OIDC provider │ Laptop        │
+├───────┼───────┼──────────────────────────────────────────────────┼───────────────┤
+│ 3     │ 3c–3d │ terragrunt apply policy + role                   │ Laptop        │
+├───────┼───────┼──────────────────────────────────────────────────┼───────────────┤
+│ 3     │ 3e    │ Verify role + trust policy in console/CLI        │ Laptop        │
+├───────┼───────┼──────────────────────────────────────────────────┼───────────────┤
+│ 4     │ 4a    │ SSH back to Dataproc node                        │ Laptop→GCP    │
+├───────┼───────┼──────────────────────────────────────────────────┼───────────────┤
+│ 4     │ 4b–4c │ Run positive test, screenshot success            │ Dataproc node │
+└───────┴───────┴──────────────────────────────────────────────────┴───────────────┘

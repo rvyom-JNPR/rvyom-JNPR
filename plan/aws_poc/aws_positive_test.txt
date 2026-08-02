@@ -1,0 +1,88 @@
+1) Phase 3a — Add bucket policy in dev account to allow the staging role:
+cat > /tmp/bucket-policy.json << 'EOF'
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Sid": "AllowCrossAccountReadRole",
+            "Effect": "Allow",
+            "Principal": {
+                "AWS": "arn:aws:iam::660610034966:role/mistsys-staging-emr-ec2"
+            },
+            "Action": [
+                "s3:GetObject",
+                "s3:ListBucket"
+            ],
+            "Resource": [
+                "arn:aws:s3:::vyom-test-cross-provider",
+                "arn:aws:s3:::vyom-test-cross-provider/*"
+            ]
+        },
+        {
+            "Sid": "ForceSSLOnlyAccess",
+            "Effect": "Deny",
+            "Principal": "*",
+            "Action": "s3:*",
+            "Resource": "arn:aws:s3:::vyom-test-cross-provider/*",
+            "Condition": {
+                "Bool": {
+                    "aws:SecureTransport": "false"
+                }
+            }
+        }
+    ]
+}
+EOF
+
+2) Phase 3b — Apply the bucket policy:
+
+aws-okta exec dev-admin -- aws s3api put-bucket-policy \
+  --bucket vyom-test-cross-provider \
+  --policy file:///tmp/bucket-policy.json
+
+3) Phase 3c — Create IAM policy in staging account:
+
+cat > /tmp/staging-emr-ctkb-policy.json << 'EOF'
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ReadCtkbTestBucket",
+      "Effect": "Allow",
+      "Action": [
+        "s3:List*",
+        "s3:Get*"
+      ],
+      "Resource": [
+        "arn:aws:s3:::vyom-test-cross-provider",
+        "arn:aws:s3:::vyom-test-cross-provider/*"
+      ]
+    }
+  ]
+}
+EOF
+
+4) create policy in staging
+aws-okta exec mist-admin -- aws iam create-policy \
+  --policy-name mistsys-staging-emr-ec2-ctkb-test \
+  --policy-document file:///tmp/staging-emr-ctkb-policy.json \
+  --description "Read access to vyom-test-cross-provider in dev account for SRE-209042 validation"
+5) Phase 3e — Attach it to the staging EMR role:
+aws-okta exec mist-admin -- aws iam attach-role-policy \
+  --role-name mistsys-staging-emr-ec2 \
+  --policy-arn arn:aws:iam::660610034966:policy/mistsys-staging-emr-ec2-ctkb-test
+
+
+6) tests
+aws-okta exec mist-admin -- aws ssm start-session \                                              ✔
+  --target i-0411e8a19cfca2965 \
+  --region us-east-1
+
+
+Starting session with SessionId: rvyom@juniper.net-iif2i76rypje2esdcy8gedoysy
+sh-5.2$ aws s3 ls s3://vyom-test-cross-provider/ 2>&1
+2026-08-02 20:10:24         21 test.txt
+sh-5.2$ aws s3 cp s3://vyom-test-cross-provider/test.txt /tmp/ctkb_result.txt && cat /tmp/ctkb_result.txt
+download: s3://vyom-test-cross-provider/test.txt to ../../tmp/ctkb_result.txt
+hello cross-provider
+sh-5.2$

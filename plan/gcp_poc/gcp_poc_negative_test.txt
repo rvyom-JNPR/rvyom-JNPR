@@ -1,0 +1,70 @@
+1 ) in aws dev i ran this
+aws-okta exec dev-admin -- aws s3api create-bucket \                                                                                   ✔
+  --bucket vyom-test-cross-provider \
+  --region us-west-2 \
+  --create-bucket-configuration LocationConstraint=us-west-2
+{
+    "Location": "http://vyom-test-cross-provider.s3.amazonaws.com/",
+    "BucketArn": "arn:aws:s3:::vyom-test-cross-provider"
+}
+
+
+2)blocked public access
+aws-okta exec dev-admin -- aws s3api put-public-access-block \
+  --bucket vyom-test-cross-provider \
+  --public-access-block-configuration \
+    BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
+3) added test file and verified
+echo 'hello cross-provider' | aws-okta exec dev-admin -- aws s3 cp - s3://vyom-test-cross-provider/test.txt
+aws-okta exec dev-admin -- aws s3 ls s3://vyom-test-cross-provider/
+4) confirm provider is not there in accounts.google.com
+aws-okta exec dev-admin -- aws iam get-open-id-connect-provider \                                                                      ✔
+  --open-id-connect-provider-arn arn:aws:iam::125952381355:oidc-provider/accounts.google.com
+{
+    "Url": "accounts.google.com",
+    "ClientIDList": [
+        "sts.amazonaws.com",
+        "https://sts.amazonaws.com",
+        "https://sts.amazonaws.com/",
+        "113831336352211318917",
+        "redirect-worker-test@mist-gcp-dev.iam.gserviceaccount.com",
+        "112716965013038150526"
+    ],
+    "ThumbprintList": [
+        "08745487e891c19e3078c1f2a07e452950ef36f6"
+    ],
+    "CreateDate": "2026-04-04T08:15:24.555000+00:00",
+    "Tags": []
+}
+
+5) Confirm IAM role is absent 
+aws-okta exec dev-admin -- aws iam get-role \
+  --role-name dataproc_mec2prod6_gcp_trust_role
+6) Confirm IAM policy does not exist
+aws-okta exec dev-admin -- aws iam list-policies --scope Local \
+  --query "Policies[?contains(PolicyName,'mec2prod6')]"
+
+
+7) SSH to dataproc node 
+gcloud compute ssh --zone "me-central2-a" "af2-action-and-suggestion-w-0" \
+  --tunnel-through-iap --project "mist-dataproc-mec2prod6"
+
+8) put the script
+9) python3 /tmp/ctkb_negative_test.py
+==================================================
+NEGATIVE TEST — expect all steps to FAIL
+==================================================
+
+[STEP 1] OIDC token fetch: SUCCESS (expected - SA can always get tokens)
+         Token preview: eyJhbGciOiJSUzI1NiIsImtpZCI6ImYxMGY4NzQw ...
+
+[STEP 2] Attempting sts:AssumeRoleWithWebIdentity ...
+         EXPECTED FAILURE: InvalidIdentityTokenException - An error occurred (InvalidIdentityToken) when calling the AssumeRoleWithWebIdentity operation: The web identity token pr
+
+[STEP 3] Attempting S3 access without valid credentials ...
+         EXPECTED FAILURE: NoCredentialsError - Unable to locate credentials
+
+==================================================
+NEGATIVE TEST COMPLETE — all failures above are expected ✓
+==================================================
+ext_rvyom_juniper_net@af2-action-and-suggestion-w-0:/tmp$

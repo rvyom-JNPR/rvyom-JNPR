@@ -1,0 +1,93 @@
+1) add SA id to OIDC provider
+aws-okta exec dev-admin -- aws iam add-client-id-to-open-id-connect-provider \
+  --open-id-connect-provider-arn arn:aws:iam::125952381355:oidc-provider/accounts.google.com \
+  --client-id 111695966871158907715
+
+2) Create the IAM policy manually in dev account:
+
+cat > /tmp/gcp-trust-policy.json << 'EOF'
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "DataprocMec2prod6ReadCtkbTestBucket",
+      "Effect": "Allow",
+      "Action": [
+        "s3:ListBucket",
+        "s3:GetObject"
+      ],
+      "Resource": [
+        "arn:aws:s3:::vyom-test-cross-provider",
+        "arn:aws:s3:::vyom-test-cross-provider/*"
+      ]
+    }
+  ]
+}
+EOF
+aws-okta exec dev-admin -- aws iam create-policy \
+  --policy-name dataproc-mec2prod6-gcp-ctkb-test \
+  --policy-document file:///tmp/gcp-trust-policy.json \
+  --description "Allows mec2prod6 Dataproc GCP SA via OIDC to read vyom-test-cross-provider"
+
+3) Create trust policy
+cat > /tmp/gcp-trust-role.json << 'EOF'
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": {
+        "Federated": "arn:aws:iam::125952381355:oidc-provider/accounts.google.com"
+      },
+      "Action": "sts:AssumeRoleWithWebIdentity",
+      "Condition": {
+        "StringEquals": {
+          "accounts.google.com:aud": "111695966871158907715",
+          "accounts.google.com:sub": "111695966871158907715"
+        }
+      }
+    }
+  ]
+}
+EOF
+
+4) Phase 3e — Create the IAM role:
+
+aws-okta exec dev-admin -- aws iam create-role \
+  --role-name dataproc_mec2prod6_gcp_trust_role \
+  --assume-role-policy-document file:///tmp/gcp-trust-role.json \
+  --description "Assumed by mec2prod6 Dataproc GCP SA via OIDC to access vyom-test-cross-provider"
+
+5) attach policy to role
+aws-okta exec dev-admin -- aws iam attach-role-policy \
+  --role-name dataproc_mec2prod6_gcp_trust_role \
+  --policy-arn arn:aws:iam::125952381355:policy/dataproc-mec2prod6-gcp-ctkb-test
+
+
+6) ssh back to node
+gcloud compute ssh --zone "me-central2-a" "af2-action-and-suggestion-w-0" \
+  --tunnel-through-iap --project "mist-dataproc-mec2prod6"
+
+
+7) python3 /tmp/ctkb_positive_test.py
+==================================================
+POSITIVE TEST — expect all steps to SUCCEED
+==================================================
+
+[STEP 1] OIDC token fetch: SUCCESS ✓
+         Token preview: eyJhbGciOiJSUzI1NiIsImtpZCI6ImI2ZGQ1MWU2 ...
+
+[STEP 2] sts:AssumeRoleWithWebIdentity: SUCCESS ✓
+         Assumed role: arn:aws:sts::125952381355:assumed-role/dataproc_mec2prod6_gcp_trust_role/ctkb-positive-test
+         Expires at  : 2026-08-02 21:23:53+00:00
+
+[STEP 3] s3:ListBucket: SUCCESS ✓
+         - test.txt ( 21 bytes )
+
+[STEP 4] s3:GetObject: SUCCESS ✓
+         File content: hello cross-provider
+
+==================================================
+POSITIVE TEST COMPLETE — all steps succeeded ✓
+==================================================
+ext_rvyom_juniper_net@af2-action-and-suggestion-w-0:~$

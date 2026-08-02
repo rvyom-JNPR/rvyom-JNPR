@@ -1,0 +1,224 @@
+================================================================================
+AWS STAGING → AWS DEV S3 CROSS-ACCOUNT ACCESS POC
+Date: 2026-08-02
+Ticket: SRE-209042
+================================================================================
+
+SOURCE:  AWS Staging Account (660610034966)
+         IAM Role: mistsys-staging-emr-ec2
+         EMR Node: i-0411e8a19cfca2965 (af2-action-and-suggestion master, us-east-1)
+
+TARGET:  AWS Dev Account (125952381355)
+         S3 Bucket: vyom-test-cross-provider (us-west-2)
+
+MECHANISM: Cross-account IAM — staging role gets S3 permissions + dev bucket policy
+           allows the staging role. BOTH sides must grant access.
+
+================================================================================
+PHASE 0 — PREP: Create S3 Bucket in AWS Dev Account
+================================================================================
+
+# (Skip if already created for GCP POC)
+
+# Create the bucket
+aws-okta exec dev-admin -- aws s3api create-bucket \
+  --bucket vyom-test-cross-provider \
+  --region us-west-2 \
+  --create-bucket-configuration LocationConstraint=us-west-2
+
+# Block public access
+aws-okta exec dev-admin -- aws s3api put-public-access-block \
+  --bucket vyom-test-cross-provider \
+  --public-access-block-configuration \
+    BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
+
+# Seed a test file
+echo 'hello cross-provider' | aws-okta exec dev-admin -- aws s3 cp - s3://vyom-test-cross-provider/test.txt
+
+# Verify
+aws-okta exec dev-admin -- aws s3 ls s3://vyom-test-cross-provider/
+# Expected: test.txt listed
+
+================================================================================
+PHASE 1 — PRE-CHECKS: Confirm Nothing Is Set Up Yet
+================================================================================
+
+# 1a. Confirm no bucket policy on dev bucket yet
+aws-okta exec dev-admin -- aws s3api get-bucket-policy \
+  --bucket vyom-test-cross-provider 2>&1
+# Expected: NoSuchBucketPolicy error (bucket exists, no policy yet)
+
+# 1b. Confirm ctkb policy NOT attached to staging EMR role
+aws-okta exec mist-admin -- aws iam list-attached-role-policies \
+  --role-name mistsys-staging-emr-ec2 \
+  --query "AttachedPolicies[?contains(PolicyName,'ctkb')]"
+# Expected: []
+
+# 1c. Confirm ctkb IAM policy does NOT exist in staging
+aws-okta exec mist-admin -- aws iam list-policies --scope Local \
+  --query "Policies[?contains(PolicyName,'ctkb')]"
+# Expected: []
+
+================================================================================
+PHASE 2 — NEGATIVE TEST: Confirm Staging EMR Role Has NO Access
+================================================================================
+
+# 2a. Find a running EMR cluster in staging
+aws-okta exec mist-admin -- aws emr list-clusters --active \
+  --region us-east-1 \
+  --query "Clusters[*].{Name:Name,Id:Id,State:Status.State}" \
+  --output table
+
+# 2b. Get master node instance ID (using af2-action-and-suggestion, id: j-7W58JTR672X)
+aws-okta exec mist-admin -- aws emr list-instances \
+  --cluster-id j-7W58JTR672X \
+  --instance-group-types MASTER \
+  --region us-east-1 \
+  --query "Instances[*].{Id:Ec2InstanceId,State:Status.State}" \
+  --output table
+# Master node: i-0411e8a19cfca2965
+
+# 2c. SSH into the EMR master node via SSM
+aws-okta exec mist-admin -- aws ssm start-session \
+  --target i-0411e8a19cfca2965 \
+  --region us-east-1
+
+# 2d. Verify IAM role on the node
+TOKEN=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" \
+  -H "X-aws-ec2-metadata-token-ttl-seconds: 21600") && \
+curl -s -H "X-aws-ec2-metadata-token: $TOKEN" \
+  http://169.254.169.254/latest/meta-data/iam/security-credentials/
+# Expected: mistsys-staging-emr-ec2
+
+# 2e. Try to list bucket — expect FAIL
+aws s3 ls s3://vyom-test-cross-provider/ 2>&1
+# ACTUAL OUTPUT:
+# An error occurred (AccessDenied) when calling the ListObjectsV2 operation:
+# User: arn:aws:sts::660610034966:assumed-role/mistsys-staging-emr-ec2/i-0411e8a19cfca2965
+# is not authorized to perform: s3:ListBucket on resource: "arn:aws:s3:::vyom-test-cross-provider"
+# because no resource-based policy allows the s3:ListBucket action
+
+# 2f. Try to download file — expect FAIL
+aws s3 cp s3://vyom-test-cross-provider/test.txt /tmp/test_negative.txt 2>&1
+# ACTUAL OUTPUT:
+# fatal error: An error occurred (403) when calling the HeadObject operation: Forbidden
+
+# Exit the EMR node
+exit
+
+================================================================================
+PHASE 3 — ENABLE ACCESS: Bucket Policy + IAM Setup
+================================================================================
+
+# NOTE: Cross-account S3 access requires BOTH sides:
+#   - Bucket policy in dev account: allow the staging role
+#   - IAM policy in staging account: allow the role to call S3
+
+# 3a. Create bucket policy document (run on laptop)
+cat > /tmp/bucket-policy.json << 'EOF'
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Sid": "AllowCrossAccountReadRole",
+            "Effect": "Allow",
+            "Principal": {
+                "AWS": "arn:aws:iam::660610034966:role/mistsys-staging-emr-ec2"
+            },
+            "Action": [
+                "s3:GetObject",
+                "s3:ListBucket"
+            ],
+            "Resource": [
+                "arn:aws:s3:::vyom-test-cross-provider",
+                "arn:aws:s3:::vyom-test-cross-provider/*"
+            ]
+        },
+        {
+            "Sid": "ForceSSLOnlyAccess",
+            "Effect": "Deny",
+            "Principal": "*",
+            "Action": "s3:*",
+            "Resource": "arn:aws:s3:::vyom-test-cross-provider/*",
+            "Condition": {
+                "Bool": {
+                    "aws:SecureTransport": "false"
+                }
+            }
+        }
+    ]
+}
+EOF
+
+# 3b. Apply bucket policy in dev account
+aws-okta exec dev-admin -- aws s3api put-bucket-policy \
+  --bucket vyom-test-cross-provider \
+  --policy file:///tmp/bucket-policy.json
+
+# 3c. Create IAM policy document for staging
+cat > /tmp/staging-emr-ctkb-policy.json << 'EOF'
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ReadCtkbTestBucket",
+      "Effect": "Allow",
+      "Action": [
+        "s3:List*",
+        "s3:Get*"
+      ],
+      "Resource": [
+        "arn:aws:s3:::vyom-test-cross-provider",
+        "arn:aws:s3:::vyom-test-cross-provider/*"
+      ]
+    }
+  ]
+}
+EOF
+
+# 3d. Create the IAM policy in staging account
+aws-okta exec mist-admin -- aws iam create-policy \
+  --policy-name mistsys-staging-emr-ec2-ctkb-test \
+  --policy-document file:///tmp/staging-emr-ctkb-policy.json \
+  --description "Read access to vyom-test-cross-provider in dev account for SRE-209042 validation"
+# Created: arn:aws:iam::660610034966:policy/mistsys-staging-emr-ec2-ctkb-test
+
+# 3e. Attach the policy to the staging EMR role
+aws-okta exec mist-admin -- aws iam attach-role-policy \
+  --role-name mistsys-staging-emr-ec2 \
+  --policy-arn arn:aws:iam::660610034966:policy/mistsys-staging-emr-ec2-ctkb-test
+
+================================================================================
+PHASE 4 — POSITIVE TEST: Confirm Staging EMR Role HAS Access
+================================================================================
+
+# 4a. SSH back into the EMR master node
+aws-okta exec mist-admin -- aws ssm start-session \
+  --target i-0411e8a19cfca2965 \
+  --region us-east-1
+
+# 4b. List the bucket
+aws s3 ls s3://vyom-test-cross-provider/ 2>&1
+# ACTUAL OUTPUT:
+# 2026-08-02 20:10:24         21 test.txt
+
+# 4c. Download the file
+aws s3 cp s3://vyom-test-cross-provider/test.txt /tmp/ctkb_result.txt && cat /tmp/ctkb_result.txt
+# ACTUAL OUTPUT:
+# download: s3://vyom-test-cross-provider/test.txt to ../../tmp/ctkb_result.txt
+# hello cross-provider
+
+================================================================================
+RESOURCES CREATED (manual - to be replaced by IaC)
+================================================================================
+
+AWS Dev Account (125952381355):
+  - S3 bucket:     vyom-test-cross-provider (us-west-2)
+  - Bucket policy: allows mistsys-staging-emr-ec2 from 660610034966 to read
+
+AWS Staging Account (660610034966):
+  - IAM policy:    arn:aws:iam::660610034966:policy/mistsys-staging-emr-ec2-ctkb-test
+  - Attached to:   mistsys-staging-emr-ec2 role
+
+IaC (PR #4320 branch rvyom/sre-209042-ctkb-access):
+  - aws-staging/auto/iam/emr-ec2/terragrunt.hcl (ctkb_test_policy added)

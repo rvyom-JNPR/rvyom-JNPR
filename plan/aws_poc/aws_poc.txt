@@ -1,0 +1,302 @@
+PHASE 0 — Prep: Create S3 Bucket in Dev Account
+
+Skip if already done from GCP POC.
+
+0a. Create bucket
+
+aws-okta exec dev-admin -- aws s3api create-bucket \
+  --bucket vyom-test-cross-provider \
+  --region us-west-2 \
+  --create-bucket-configuration LocationConstraint=us-west-2
+
+0b. Block public access
+
+aws-okta exec dev-admin -- aws s3api put-public-access-block \
+  --bucket vyom-test-cross-provider \
+  --public-access-block-configuration \
+    BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
+
+0c. Seed test file
+
+echo 'hello cross-provider' | aws-okta exec dev-admin -- aws s3 cp - s3://vyom-test-cross-provider/test.txt
+aws-okta exec dev-admin -- aws s3 ls s3://vyom-test-cross-provider/
+# Expected: test.txt listed
+
+────────────────────
+
+PHASE 1 — Pre-checks: Confirm Nothing Is Set Up Yet
+
+Run from your laptop. Screenshot all outputs.
+
+1a. Confirm NO bucket policy exists on dev bucket yet
+
+aws-okta exec dev-admin -- aws s3api get-bucket-policy \
+  --bucket vyom-test-cross-provider
+# Expected: NoSuchBucketPolicy error
+
+1b. Confirm ctkb policy NOT yet attached to staging EMR role
+
+aws-okta exec mist-admin -- aws iam list-attached-role-policies \
+  --role-name mistsys-staging-emr-ec2 \
+  | grep ctkb
+# Expected: empty — no ctkb policy listed
+
+1c. Confirm ctkb IAM policy does NOT exist in staging
+
+aws-okta exec mist-admin -- aws iam list-policies --scope Local \
+  --query "Policies[?contains(PolicyName,'ctkb')]"
+# Expected: []
+
+────────────────────
+
+PHASE 2 — Negative Test: Confirm Staging EMR Role Cannot Access Dev Bucket
+
+2a. Simulate as the staging EMR role from your laptop
+
+# Assume the staging EMR role temporarily to simulate
+aws-okta exec mist-admin -- aws sts assume-role \
+  --role-arn arn:aws:iam::660610034966:role/mistsys-staging-emr-ec2 \
+  --role-session-name ctkb-negative-test
+
+Note the temp credentials ( AccessKeyId ,  SecretAccessKey ,  SessionToken )
+
+2b. Try to list bucket — expect FAIL
+
+AWS_ACCESS_KEY_ID=<from above> \
+AWS_SECRET_ACCESS_KEY=<from above> \
+AWS_SESSION_TOKEN=<from above> \
+aws s3 ls s3://vyom-test-cross-provider/
+# Expected: Access Denied
+
+2c. Try to download file — expect FAIL
+
+AWS_ACCESS_KEY_ID=<from above> \
+AWS_SECRET_ACCESS_KEY=<from above> \
+AWS_SESSION_TOKEN=<from above> \
+aws s3 cp s3://vyom-test-cross-provider/test.txt /tmp/test_negative.txt
+# Expected: Access Denied
+
+Or as a single script:
+
+cat > /tmp/aws_negative_test.sh << 'EOF'
+#!/bin/bash
+echo "=================================================="
+echo "NEGATIVE TEST — expect all steps to FAIL"
+echo "=================================================="
+
+CREDS=$(aws-okta exec mist-admin -- aws sts assume-role \
+  --role-arn arn:aws:iam::660610034966:role/mistsys-staging-emr-ec2 \
+  --role-session-name ctkb-negative-test \
+  --output json)
+
+export AWS_ACCESS_KEY_ID=$(echo $CREDS | python3 -c "import sys,json; print(json.load(sys.stdin)['Credentials']['AccessKeyId'])")
+export AWS_SECRET_ACCESS_KEY=$(echo $CREDS | python3 -c "import sys,json; print(json.load(sys.stdin)['Credentials']['SecretAccessKey'])")
+export AWS_SESSION_TOKEN=$(echo $CREDS | python3 -c "import sys,json; print(json.load(sys.stdin)['Credentials']['SessionToken'])")
+
+echo ""
+echo "[STEP 1] Assumed staging role: mistsys-staging-emr-ec2 ✓"
+echo "         Caller identity:"
+aws sts get-caller-identity
+
+echo ""
+echo "[STEP 2] Attempting s3:ListBucket on vyom-test-cross-provider ..."
+aws s3 ls s3://vyom-test-cross-provider/ 2>&1 | sed 's/^/         /'
+
+echo ""
+echo "[STEP 3] Attempting s3:GetObject on test.txt ..."
+aws s3 cp s3://vyom-test-cross-provider/test.txt /tmp/ctkb_negative.txt 2>&1 | sed 's/^/         /'
+
+echo ""
+echo "=================================================="
+echo "NEGATIVE TEST COMPLETE — all failures above expected ✓"
+echo "=================================================="
+EOF
+bash /tmp/aws_negative_test.sh
+
+✅ Expected output:
+
+==================================================
+NEGATIVE TEST — expect all steps to FAIL
+==================================================
+
+[STEP 1] Assumed staging role: mistsys-staging-emr-ec2 ✓
+         Caller identity: { "Account": "660610034966", "Arn": "...mistsys-staging-emr-ec2/..." }
+
+[STEP 2] Attempting s3:ListBucket on vyom-test-cross-provider ...
+         An error occurred (AccessDenied) ...
+
+[STEP 3] Attempting s3:GetObject on test.txt ...
+         fatal error: An error occurred (403) ...
+
+==================================================
+NEGATIVE TEST COMPLETE — all failures above expected ✓
+==================================================
+
+📸 Screenshot this — proof of no access before setup.
+
+────────────────────
+
+PHASE 3 — Enable Access: Bucket Policy + IaC Apply
+
+Two things must happen in parallel — both are required for cross-account access.
+
+3a. Add bucket policy in dev account (allows staging role to read)
+
+Create  bucket-policy.json :
+
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Sid": "AllowCrossAccountReadRole",
+            "Effect": "Allow",
+            "Principal": {
+                "AWS": "arn:aws:iam::660610034966:role/mistsys-staging-emr-ec2"
+            },
+            "Action": [
+                "s3:GetObject",
+                "s3:ListBucket"
+            ],
+            "Resource": [
+                "arn:aws:s3:::vyom-test-cross-provider",
+                "arn:aws:s3:::vyom-test-cross-provider/*"
+            ]
+        },
+        {
+            "Sid": "ForceSSLOnlyAccess",
+            "Effect": "Deny",
+            "Principal": "*",
+            "Action": "s3:*",
+            "Resource": "arn:aws:s3:::vyom-test-cross-provider/*",
+            "Condition": {
+                "Bool": {
+                    "aws:SecureTransport": "false"
+                }
+            }
+        }
+    ]
+}
+
+Apply it:
+
+aws-okta exec dev-admin -- aws s3api put-bucket-policy \
+  --bucket vyom-test-cross-provider \
+  --policy file://bucket-policy.json
+
+Verify:
+
+aws-okta exec dev-admin -- aws s3api get-bucket-policy \
+  --bucket vyom-test-cross-provider \
+  --query Policy --output text | python3 -m json.tool
+# Expected: policy with mistsys-staging-emr-ec2 listed
+
+3b. Apply IaC in aws-staging (attaches ctkb policy to the role)
+
+cd aws-staging/auto/iam/emr-ec2
+terragrunt apply
+
+This creates and attaches  mistsys-staging-emr-ec2-ctkb-test  policy granting:
+
+•  s3:List*  /  s3:Get*  on  vyom-test-cross-provider  in dev account
+
+3c. Verify policy is now attached to the role
+
+aws-okta exec mist-admin -- aws iam list-attached-role-policies \
+  --role-name mistsys-staging-emr-ec2 \
+  | grep ctkb
+# Expected: "mistsys-staging-emr-ec2-ctkb-test" listed
+
+aws-okta exec mist-admin -- aws iam get-role-policy \
+  --role-name mistsys-staging-emr-ec2 \
+  --policy-name mistsys-staging-emr-ec2-ctkb-test 2>/dev/null || \
+aws-okta exec mist-admin -- aws iam list-attached-role-policies \
+  --role-name mistsys-staging-emr-ec2
+
+────────────────────
+
+PHASE 4 — Positive Test: Confirm Staging EMR Role CAN Access Dev Bucket
+
+cat > /tmp/aws_positive_test.sh << 'EOF'
+#!/bin/bash
+echo "=================================================="
+echo "POSITIVE TEST — expect all steps to SUCCEED"
+echo "=================================================="
+
+CREDS=$(aws-okta exec mist-admin -- aws sts assume-role \
+  --role-arn arn:aws:iam::660610034966:role/mistsys-staging-emr-ec2 \
+  --role-session-name ctkb-positive-test \
+  --output json)
+
+export AWS_ACCESS_KEY_ID=$(echo $CREDS | python3 -c "import sys,json; print(json.load(sys.stdin)['Credentials']['AccessKeyId'])")
+export AWS_SECRET_ACCESS_KEY=$(echo $CREDS | python3 -c "import sys,json; print(json.load(sys.stdin)['Credentials']['SecretAccessKey'])")
+export AWS_SESSION_TOKEN=$(echo $CREDS | python3 -c "import sys,json; print(json.load(sys.stdin)['Credentials']['SessionToken'])")
+
+echo ""
+echo "[STEP 1] Assumed staging role: mistsys-staging-emr-ec2 ✓"
+aws sts get-caller-identity
+
+echo ""
+echo "[STEP 2] s3:ListBucket on vyom-test-cross-provider ..."
+aws s3 ls s3://vyom-test-cross-provider/ 2>&1 | sed 's/^/         /'
+
+echo ""
+echo "[STEP 3] s3:GetObject — downloading test.txt ..."
+aws s3 cp s3://vyom-test-cross-provider/test.txt /tmp/ctkb_positive.txt 2>&1
+echo "         File content: $(cat /tmp/ctkb_positive.txt)"
+
+echo ""
+echo "=================================================="
+echo "POSITIVE TEST COMPLETE — all steps succeeded ✓"
+echo "=================================================="
+EOF
+bash /tmp/aws_positive_test.sh
+
+✅ Expected output:
+
+==================================================
+POSITIVE TEST — expect all steps to SUCCEED
+==================================================
+
+[STEP 1] Assumed staging role: mistsys-staging-emr-ec2 ✓
+         { "Account": "660610034966", "Arn": "...mistsys-staging-emr-ec2/ctkb-positive-test" }
+
+[STEP 2] s3:ListBucket on vyom-test-cross-provider ...
+         2026-08-02  test.txt
+
+[STEP 3] s3:GetObject — downloading test.txt ...
+         download: s3://vyom-test-cross-provider/test.txt -> /tmp/ctkb_positive.txt
+         File content: hello cross-provider
+
+==================================================
+POSITIVE TEST COMPLETE — all steps succeeded ✓
+==================================================
+
+📸 Screenshot this — proof of access working after IaC applied.
+
+────────────────────
+
+Summary Checklist
+
+┌───────┬───────┬───────────────────────────────────────────┬────────────────────────┐
+│ Phase │ Step  │ Action                                    │ Where                  │
+├───────┼───────┼───────────────────────────────────────────┼────────────────────────┤
+│ 0     │ 0a–0c │ Create + seed vyom-test-cross-provider    │ Laptop (dev creds)     │
+├───────┼───────┼───────────────────────────────────────────┼────────────────────────┤
+│ 1     │ 1a    │ Verify no bucket policy exists            │ Laptop (dev creds)     │
+├───────┼───────┼───────────────────────────────────────────┼────────────────────────┤
+│ 1     │ 1b–1c │ Verify no ctkb policy on staging role     │ Laptop (staging creds) │
+├───────┼───────┼───────────────────────────────────────────┼────────────────────────┤
+│ 2     │ 2a–2c │ Run negative test → AccessDenied expected │ Laptop                 │
+├───────┼───────┼───────────────────────────────────────────┼────────────────────────┤
+│ 3a    │       │ Put bucket policy in dev account          │ Laptop (dev creds)     │
+├───────┼───────┼───────────────────────────────────────────┼────────────────────────┤
+│ 3b    │       │ terragrunt apply emr-ec2 in aws-staging   │ Laptop                 │
+├───────┼───────┼───────────────────────────────────────────┼────────────────────────┤
+│ 3c    │       │ Verify policy attached to role            │ Laptop (staging creds) │
+├───────┼───────┼───────────────────────────────────────────┼────────────────────────┤
+│ 4     │       │ Run positive test → all steps succeed     │ Laptop                 │
+└───────┴───────┴───────────────────────────────────────────┴────────────────────────┘
+
+────────────────────
+
+Key difference from GCP POC: AWS→AWS cross-account requires both sides to grant access — the IAM role policy in staging AND the bucket policy in dev. GCP→AWS only needed the AWS side (OIDC trust + IAM role).
