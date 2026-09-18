@@ -89,19 +89,17 @@ wc -l redis-wlc-monitor-*.log
 head -20 redis-wlc-monitor-*.log
 ```
 
-### 4. Upload results for the investigation
+### 4. Zip and share results on Slack
 
 ```bash
-gcloud storage cp redis-wlc-slowlog-<timestamp>.log \
-  gs://mist-redis-backup-production/investigation/
-gcloud storage cp redis-wlc-monitor-<timestamp>.log \
-  gs://mist-redis-backup-production/investigation/
+zip redis-wlc-investigation-$(date +%Y%m%d-%H%M%S).zip \
+  redis-wlc-slowlog-*.log redis-wlc-monitor-*.log
 ```
 
-Share the resulting `gs://mist-redis-backup-production/investigation/...` path(s) with
-the requester (e.g., Nicolas Dade) along with a short summary (e.g., slowlog entry
-count, top commands by CPU from `commandstats`, and whether MONITOR shows abnormal
-traffic volume vs. genuinely slow commands).
+Upload the resulting `.zip` directly to the relevant Slack thread/channel (e.g., to
+Nicolas Dade) along with a short summary (e.g., slowlog entry count, top commands by
+CPU from `commandstats`, and whether MONITOR shows abnormal traffic volume vs.
+genuinely slow commands).
 
 ## Gotchas
 
